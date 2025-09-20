@@ -1,13 +1,18 @@
+#!/usr/bin/env python3
+"""
+Simple PKL College Recommendation Model
+Creates a machine learning model for college recommendations and saves it to PKL format.
+"""
+
 import pandas as pd
 import numpy as np
-import h5py
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 import joblib
 import os
 from cutoff_data_parser import CutoffDataParser, initialize_cutoff_data
 
-class SimpleH5Model:
+class SimplePKLModel:
     def __init__(self):
         self.model = None
         self.branch_encoder = LabelEncoder()
@@ -105,60 +110,55 @@ class SimpleH5Model:
         self.is_trained = True
         return True
     
-    def save_h5_model(self, filename='college_model.h5'):
-        """Save model data to H5 file"""
+    def save_pkl_model(self, filename='college_model.pkl'):
+        """Save model data to PKL file"""
         if not self.is_trained:
             print("Model not trained yet!")
             return False
         
-        # Create H5 file
-        with h5py.File(filename, 'w') as f:
-            # Save model parameters
-            f.create_dataset('branch_classes', data=[s.encode('utf-8') for s in self.branch_encoder.classes_])
-            f.create_dataset('college_classes', data=[s.encode('utf-8') for s in self.college_encoder.classes_])
-            f.create_dataset('scaler_mean', data=self.scaler.mean_)
-            f.create_dataset('scaler_scale', data=self.scaler.scale_)
-            
-            # Save model feature importances
-            f.create_dataset('feature_importances', data=self.model.feature_importances_)
-            
-            # Save some sample predictions for validation
-            sample_branches = self.branch_encoder.transform(self.branch_encoder.classes_[:5])
-            sample_percentiles = np.array([85.0, 90.0, 95.0, 80.0, 88.0])
-            sample_ranks = np.array([15000, 10000, 5000, 20000, 12000])
-            
-            sample_X = np.column_stack([sample_branches, sample_percentiles, sample_ranks])
-            sample_X_scaled = self.scaler.transform(sample_X)
-            sample_predictions = self.model.predict(sample_X_scaled)
-            
-            f.create_dataset('sample_predictions', data=sample_predictions)
+        # Prepare all model data for saving
+        model_data = {
+            'model': self.model,
+            'branch_encoder': self.branch_encoder,
+            'college_encoder': self.college_encoder,
+            'scaler': self.scaler,
+            'feature_importances': self.model.feature_importances_,
+            'is_trained': self.is_trained
+        }
+        
+        # Save everything to a single PKL file
+        joblib.dump(model_data, filename)
+        
+        # Save some sample predictions for validation
+        sample_branches = self.branch_encoder.transform(self.branch_encoder.classes_[:5])
+        sample_percentiles = np.array([85.0, 90.0, 95.0, 80.0, 88.0])
+        sample_ranks = np.array([15000, 10000, 5000, 20000, 12000])
+        
+        sample_X = np.column_stack([sample_branches, sample_percentiles, sample_ranks])
+        sample_X_scaled = self.scaler.transform(sample_X)
+        sample_predictions = self.model.predict(sample_X_scaled)
         
         print(f"Model saved to {filename}")
+        print(f"Sample predictions: {sample_predictions}")
         return True
     
-    def load_h5_model(self, filename='college_model.h5'):
-        """Load model from H5 file"""
+    def load_pkl_model(self, filename='college_model.pkl'):
+        """Load model from PKL file"""
         try:
-            with h5py.File(filename, 'r') as f:
-                # Load encoders
-                branch_classes = [s.decode('utf-8') for s in f['branch_classes'][:]]
-                college_classes = [s.decode('utf-8') for s in f['college_classes'][:]]
-                
-                self.branch_encoder.fit(branch_classes)
-                self.college_encoder.fit(college_classes)
-                
-                # Load scaler
-                self.scaler.mean_ = f['scaler_mean'][:]
-                self.scaler.scale_ = f['scaler_scale'][:]
-                
-                # Load feature importances
-                feature_importances = f['feature_importances'][:]
-                
-                print(f"Model loaded from {filename}")
-                print(f"Feature importances: {feature_importances}")
-                
-                self.is_trained = True
-                return True
+            model_data = joblib.load(filename)
+            
+            # Load all components
+            self.model = model_data['model']
+            self.branch_encoder = model_data['branch_encoder']
+            self.college_encoder = model_data['college_encoder']
+            self.scaler = model_data['scaler']
+            self.feature_importances = model_data['feature_importances']
+            self.is_trained = model_data['is_trained']
+            
+            print(f"Model loaded from {filename}")
+            print(f"Available branches: {len(self.branch_encoder.classes_)}")
+            print(f"Available colleges: {len(self.college_encoder.classes_)}")
+            return True
                 
         except Exception as e:
             print(f"Error loading model: {e}")
@@ -243,17 +243,17 @@ class SimpleH5Model:
         return max(0.0, min(100.0, percentile))
 
 def main():
-    """Main function to create and test the H5 model"""
-    print("Creating Simple H5 College Recommendation Model")
+    """Main function to create and test the PKL model"""
+    print("Creating Simple PKL College Recommendation Model")
     print("=" * 50)
     
     # Create model
-    model = SimpleH5Model()
+    model = SimplePKLModel()
     
     # Train model
     if model.train_model():
-        # Save H5 model
-        model.save_h5_model()
+        # Save PKL model
+        model.save_pkl_model()
         
         # Test the model
         print("\n" + "=" * 30)

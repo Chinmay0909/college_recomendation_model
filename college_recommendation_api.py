@@ -1,36 +1,106 @@
 #!/usr/bin/env python3
 """
-College Recommendation API Script
-This script loads a pretrained H5 model and provides college recommendations.
-Can be easily converted to Flask/FastAPI for backend deployment.
+College Recommendation FastAPI Backend
+This FastAPI application loads a pretrained PKL model and provides college recommendations.
 """
 
-import h5py
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-import json
+import joblib
 import os
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 import logging
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Pydantic models
+class RecommendationRequest(BaseModel):
+    branch: str = Field(..., description="Desired branch/stream")
+    jee_rank: int = Field(..., gt=0, description="JEE Main rank")
+    cet_rank: int = Field(..., gt=0, description="CET rank")
+    top_n: int = Field(15, ge=1, le=50, description="Number of recommendations to return")
+
+class StudentProfile(BaseModel):
+    branch: str
+    jee_rank: int
+    cet_rank: int
+    jee_percentile: float
+    cet_percentile: float
+    used_percentile: float
+    used_rank: int
+
+class CollegeRecommendation(BaseModel):
+    college: str
+    score: float
+    base_score: float
+
+class RecommendationResponse(BaseModel):
+    success: bool
+    student_profile: StudentProfile
+    recommendations: List[CollegeRecommendation]
+    total_colleges_analyzed: int
+    model_info: Dict
+
+class ErrorResponse(BaseModel):
+    success: bool
+    error: str
+    available_branches: Optional[List[str]] = None
+
+class ModelInfo(BaseModel):
+    is_loaded: bool
+    model_path: str
+    total_branches: int
+    total_colleges: int
+    feature_importances: List[float]
+
+# Global variable for the API instance
+api_instance = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global api_instance
+    api_instance = CollegeRecommendationAPI()
+    if not api_instance.is_loaded:
+        logger.error("Failed to load model during startup")
+    yield
+    logger.info("Shutting down the application")
+
+app = FastAPI(
+    title="College Recommendation API",
+    description="FastAPI backend for college recommendations based on student profiles",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
 class CollegeRecommendationAPI:
     """
-    College Recommendation API class that loads pretrained H5 model
+    College Recommendation API class that loads pretrained PKL model
     and provides college recommendations based on student inputs.
     """
     
-    def __init__(self, model_path: str = 'college_model.h5'):
+    def __init__(self, model_path: str = 'college_model.pkl'):
         """
         Initialize the API with model path
         
         Args:
-            model_path (str): Path to the pretrained H5 model file
+            model_path (str): Path to the pretrained PKL model file
         """
         self.model_path = model_path
         self.branch_encoder = LabelEncoder()
@@ -44,7 +114,7 @@ class CollegeRecommendationAPI:
     
     def load_model(self) -> bool:
         """
-        Load the pretrained H5 model and encoders
+        Load the pretrained PKL model and encoders
         
         Returns:
             bool: True if model loaded successfully, False otherwise
@@ -54,31 +124,25 @@ class CollegeRecommendationAPI:
                 logger.error(f"Model file not found: {self.model_path}")
                 return False
             
-            with h5py.File(self.model_path, 'r') as f:
-                # Load branch classes
-                branch_classes = [s.decode('utf-8') for s in f['branch_classes'][:]]
-                self.branch_encoder.fit(branch_classes)
-                
-                # Load college classes
-                college_classes = [s.decode('utf-8') for s in f['college_classes'][:]]
-                self.college_encoder.fit(college_classes)
-                
-                # Load scaler parameters
-                self.scaler.mean_ = f['scaler_mean'][:]
-                self.scaler.scale_ = f['scaler_scale'][:]
-                
-                # Load feature importances
-                self.feature_importances = f['feature_importances'][:]
-                
-                logger.info(f"Model loaded successfully from {self.model_path}")
-                logger.info(f"Available branches: {len(branch_classes)}")
-                logger.info(f"Available colleges: {len(college_classes)}")
-                
-                self.is_loaded = True
-                return True
+            # Load all model data from PKL file
+            model_data = joblib.load(self.model_path)
+            
+            # Extract all components
+            self.model = model_data['model']
+            self.branch_encoder = model_data['branch_encoder']
+            self.college_encoder = model_data['college_encoder']
+            self.scaler = model_data['scaler']
+            self.feature_importances = model_data['feature_importances']
+            
+            logger.info(f"Model loaded successfully from {self.model_path}")
+            logger.info(f"Available branches: {len(self.branch_encoder.classes_)}")
+            logger.info(f"Available colleges: {len(self.college_encoder.classes_)}")
+            
+            self.is_loaded = True
+            return True
                 
         except Exception as e:
-            logger.error(f"Error loading H5 model: {e}")
+            logger.error(f"Error loading model: {e}")
             return False
     
     def rank_to_percentile(self, rank: int, total_candidates: int = 1000000) -> float:
@@ -185,8 +249,8 @@ class CollegeRecommendationAPI:
                 X = np.array([[branch_encoded, student_percentile, student_rank]])
                 X_scaled = self.scaler.transform(X)
                 
-                # Calculate base score using feature importances
-                base_score = np.sum(self.feature_importances * X_scaled[0])
+                # Use the actual trained model for prediction
+                base_score = self.model.predict(X_scaled)[0]
                 
                 # Calculate enhanced score
                 final_score = self.calculate_enhanced_score(college_name, branch, base_score)
@@ -217,7 +281,8 @@ class CollegeRecommendationAPI:
                 'total_colleges_analyzed': len(self.college_encoder.classes_),
                 'model_info': {
                     'model_path': self.model_path,
-                    'feature_importances': self.feature_importances.tolist()
+                    'feature_importances': self.feature_importances.tolist(),
+                    'model_type': 'PKL'
                 }
             }
             
@@ -269,107 +334,69 @@ class CollegeRecommendationAPI:
             'feature_importances': self.feature_importances.tolist() if self.is_loaded else []
         }
 
-def demo_get_top15():
+# FastAPI Endpoints
+
+@app.get("/", summary="Health Check")
+async def health_check():
+    """Health check endpoint"""
+    return {"message": "College Recommendation API is running", "status": "healthy"}
+
+@app.post("/recommendations", response_model=RecommendationResponse, summary="Get College Recommendations")
+async def get_recommendations(request: RecommendationRequest):
     """
-    Demo function showing how to get top 15 colleges
+    Get college recommendations based on student profile
+    
+    - **branch**: Desired branch/stream (e.g., "Computer Science Engineering")
+    - **jee_rank**: JEE Main rank (must be > 0)
+    - **cet_rank**: CET rank (must be > 0)
+    - **top_n**: Number of recommendations to return (1-50, default: 15)
     """
-    print("🎓 DEMO: Getting Top 15 College Recommendations")
-    print("=" * 60)
+    if not api_instance or not api_instance.is_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded. Please check server status.")
     
-    # Initialize the API
-    api = CollegeRecommendationAPI()
-    
-    if not api.is_loaded:
-        print("❌ Failed to load model. Please train the model first.")
-        print("Run: python simple_h5_model.py")
-        return
-    
-    # Example: Get top 15 recommendations
-    result = api.get_recommendations(
-        branch="Computer Science Engineering",
-        jee_rank=15000,
-        cet_rank=20000,
-        top_n=15  # This ensures we get exactly 15 recommendations
+    result = api_instance.get_recommendations(
+        branch=request.branch,
+        jee_rank=request.jee_rank,
+        cet_rank=request.cet_rank,
+        top_n=request.top_n
     )
     
-    if result['success']:
-        print(f"✅ Successfully generated {len(result['recommendations'])} recommendations!")
-        print(f"📊 Student Profile: {result['student_profile']['used_percentile']}% percentile")
-        
-        print(f"\n🏆 ALL {len(result['recommendations'])} COLLEGE RECOMMENDATIONS:")
-        print("=" * 60)
-        
-        for i, rec in enumerate(result['recommendations'], 1):
-            print(f"{i:2d}. {rec['college']}")
-            print(f"    Score: {rec['score']:.4f}")
-            if i % 5 == 0:  # Add separator every 5 colleges
-                print("    " + "-" * 50)
-            print()
-    else:
-        print(f"❌ Error: {result['error']}")
-
-def main():
-    """
-    Main function for testing the API
-    """
-    print("🎓 College Recommendation API - Testing")
-    print("=" * 50)
-    
-    # Initialize the API
-    api = CollegeRecommendationAPI()
-    
-    if not api.is_loaded:
-        print("❌ Failed to load model. Please train the model first.")
-        print("Run: python simple_h5_model.py")
-        return
-    
-    # Test cases
-    test_cases = [
-        {
-            'branch': 'Computer Science Engineering',
-            'jee_rank': 15000,
-            'cet_rank': 20000,
-            'top_n': 15
-        },
-        {
-            'branch': 'Mechanical Engineering',
-            'jee_rank': 25000,
-            'cet_rank': 30000,
-            'top_n': 15
-        }
-    ]
-    
-    for i, test_case in enumerate(test_cases, 1):
-        print(f"\n🧪 Test Case {i}:")
-        print(f"   Branch: {test_case['branch']}")
-        print(f"   JEE Rank: {test_case['jee_rank']}")
-        print(f"   CET Rank: {test_case['cet_rank']}")
-        
-        # Get recommendations
-        result = api.get_recommendations(**test_case)
-        
-        if result['success']:
-            print(f"✅ Success! Generated {len(result['recommendations'])} recommendations")
-            print(f"   Student Profile: {result['student_profile']['used_percentile']}% percentile")
-            
-            print(f"\n🏆 Top {len(result['recommendations'])} Recommendations:")
-            for j, rec in enumerate(result['recommendations'], 1):
-                print(f"   {j:2d}. {rec['college']} (Score: {rec['score']:.4f})")
-                if j % 5 == 0:  # Add separator every 5 colleges
-                    print("   " + "-" * 50)
+    if not result['success']:
+        if 'available_branches' in result:
+            raise HTTPException(
+                status_code=400, 
+                detail=result['error'],
+                headers={"available_branches": str(result['available_branches'])}
+            )
         else:
-            print(f"❌ Error: {result['error']}")
+            raise HTTPException(status_code=500, detail=result['error'])
     
-    # Show model info
-    print(f"\n📊 Model Information:")
-    model_info = api.get_model_info()
-    print(f"   Total Branches: {model_info['total_branches']}")
-    print(f"   Total Colleges: {model_info['total_colleges']}")
-    print(f"   Model Path: {model_info['model_path']}")
+    return result
+
+@app.get("/branches", response_model=List[str], summary="Get Available Branches")
+async def get_available_branches():
+    """Get list of all available branches/streams"""
+    if not api_instance or not api_instance.is_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded. Please check server status.")
     
-    # Run the top 15 demo
-    print(f"\n" + "="*60)
-    demo_get_top15()
+    return api_instance.get_available_branches()
+
+@app.get("/colleges", response_model=List[str], summary="Get Available Colleges")
+async def get_available_colleges():
+    """Get list of all available colleges"""
+    if not api_instance or not api_instance.is_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded. Please check server status.")
+    
+    return api_instance.get_available_colleges()
+
+@app.get("/model-info", response_model=ModelInfo, summary="Get Model Information")
+async def get_model_info():
+    """Get information about the loaded model"""
+    if not api_instance:
+        raise HTTPException(status_code=503, detail="API instance not initialized")
+    
+    return api_instance.get_model_info()
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

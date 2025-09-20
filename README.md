@@ -37,17 +37,63 @@ A machine learning-based college recommendation system that helps students find 
    cd college-recommendation-system
    ```
 
-2. **Install dependencies**:
+2. **Create virtual environment** (recommended):
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+
+3. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Run the application**:
+4. **Train the model** (if not already done):
    ```bash
-   python app.py
+   python simple_h5_model.py
    ```
 
-4. **Open your browser** and go to `http://localhost:5000`
+5. **Start the FastAPI backend**:
+   ```bash
+   python start_api.py
+   ```
+
+6. **Access the API**:
+   - API Server: `http://localhost:8000`
+   - Interactive Docs: `http://localhost:8000/docs`
+   - Alternative Docs: `http://localhost:8000/redoc`
+
+## FastAPI Backend Usage
+
+The FastAPI backend provides several endpoints:
+
+### Available Endpoints
+
+- **GET `/`** - Health check
+- **POST `/recommendations`** - Get college recommendations
+- **GET `/branches`** - Get available branches
+- **GET `/colleges`** - Get available colleges  
+- **GET `/model-info`** - Get model information
+
+### Example API Request
+
+```bash
+curl -X POST "http://localhost:8000/recommendations" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "branch": "Computer Science Engineering",
+       "jee_rank": 15000,
+       "cet_rank": 20000,
+       "top_n": 10
+     }'
+```
+
+### Testing the API
+
+Run the test script to verify everything works:
+```bash
+python test_api.py
+```
 
 ## Usage
 
