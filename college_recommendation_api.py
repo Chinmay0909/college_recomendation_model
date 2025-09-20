@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
+from cutoff_data_parser import CutoffDataParser, initialize_cutoff_data
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -95,7 +96,7 @@ class CollegeRecommendationAPI:
     and provides college recommendations based on student inputs.
     """
     
-    def __init__(self, model_path: str = 'college_model.pkl'):
+    def __init__(self, model_path: str = 'models/college_recommendation_model.pkl'):
         """
         Initialize the API with model path
         
@@ -108,41 +109,89 @@ class CollegeRecommendationAPI:
         self.scaler = StandardScaler()
         self.model = None
         self.is_loaded = False
+        self.cutoff_data = None
         
-        # Load the model on initialization
+        # Load the model and cutoff data on initialization
         self.load_model()
+        self.load_cutoff_data()
     
     def load_model(self) -> bool:
         """
-        Load the pretrained PKL model and encoders
+        Load the pretrained PKL model and encoders from separate files
         
         Returns:
             bool: True if model loaded successfully, False otherwise
         """
         try:
-            if not os.path.exists(self.model_path):
-                logger.error(f"Model file not found: {self.model_path}")
-                return False
+            # Check if individual model files exist
+            model_files = {
+                'model': 'models/college_recommendation_model.pkl',
+                'branch_encoder': 'models/branch_encoder.pkl',
+                'college_encoder': 'models/college_encoder.pkl',
+                'scaler': 'models/scaler.pkl'
+            }
             
-            # Load all model data from PKL file
-            model_data = joblib.load(self.model_path)
+            # Load each component separately
+            for component, file_path in model_files.items():
+                if not os.path.exists(file_path):
+                    logger.warning(f"Model file not found: {file_path}")
+                    continue
+                
+                if component == 'model':
+                    self.model = joblib.load(file_path)
+                elif component == 'branch_encoder':
+                    self.branch_encoder = joblib.load(file_path)
+                elif component == 'college_encoder':
+                    self.college_encoder = joblib.load(file_path)
+                elif component == 'scaler':
+                    self.scaler = joblib.load(file_path)
             
-            # Extract all components
-            self.model = model_data['model']
-            self.branch_encoder = model_data['branch_encoder']
-            self.college_encoder = model_data['college_encoder']
-            self.scaler = model_data['scaler']
-            self.feature_importances = model_data['feature_importances']
+            # Check if we have the essential components
+            if self.model is not None and hasattr(self.model, 'feature_importances_'):
+                self.feature_importances = self.model.feature_importances_
+            else:
+                self.feature_importances = np.array([])
             
-            logger.info(f"Model loaded successfully from {self.model_path}")
-            logger.info(f"Available branches: {len(self.branch_encoder.classes_)}")
-            logger.info(f"Available colleges: {len(self.college_encoder.classes_)}")
-            
-            self.is_loaded = True
-            return True
+            # For cutoff-based recommendations, we don't strictly need the ML model
+            # but we'll mark as loaded if we have the encoders or if cutoff data is available
+            if (self.branch_encoder is not None and self.college_encoder is not None) or self.cutoff_data is not None:
+                self.is_loaded = True
+                logger.info("Model components loaded successfully")
+                if self.branch_encoder is not None:
+                    logger.info(f"Available branches: {len(self.branch_encoder.classes_)}")
+                if self.college_encoder is not None:
+                    logger.info(f"Available colleges: {len(self.college_encoder.classes_)}")
+                return True
+            else:
+                logger.warning("No model components loaded, will rely on cutoff data only")
+                self.is_loaded = True  # Still mark as loaded since we can work with cutoff data
+                return True
                 
         except Exception as e:
             logger.error(f"Error loading model: {e}")
+            # Even if model loading fails, we can still work with cutoff data
+            self.is_loaded = True
+            return True
+    
+    def load_cutoff_data(self) -> bool:
+        """
+        Load cutoff data from CSV files
+        
+        Returns:
+            bool: True if cutoff data loaded successfully, False otherwise
+        """
+        try:
+            parser, self.cutoff_data = initialize_cutoff_data()
+            
+            if self.cutoff_data.empty:
+                logger.error("No cutoff data available!")
+                return False
+                
+            logger.info(f"Loaded {len(self.cutoff_data)} cutoff records")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error loading cutoff data: {e}")
             return False
     
     def rank_to_percentile(self, rank: int, total_candidates: int = 1000000) -> float:
@@ -161,45 +210,70 @@ class CollegeRecommendationAPI:
         percentile = ((total_candidates - rank) / total_candidates) * 100
         return max(0.0, min(100.0, percentile))
     
-    def calculate_enhanced_score(self, college_name: str, branch: str, 
-                               base_score: float) -> float:
+    def calculate_recommendation_score(self, college_name: str, branch: str, 
+                                     student_percentile: float, student_rank: int,
+                                     cutoff_percentile: float, cutoff_rank: int) -> float:
         """
-        Calculate enhanced score with quality, branch, and location boosts
+        Calculate recommendation score based on multiple factors
         
         Args:
             college_name (str): Name of the college
             branch (str): Desired branch
-            base_score (float): Base prediction score
+            student_percentile (float): Student's percentile
+            student_rank (int): Student's rank
+            cutoff_percentile (float): College's cutoff percentile
+            cutoff_rank (int): College's cutoff rank
             
         Returns:
-            float: Enhanced final score
+            float: Recommendation score (0-1)
         """
-        # 1. College quality boost (based on name patterns)
+        score = 0.0
+        
+        # 1. Eligibility margin (how much better the student is than cutoff)
+        if not pd.isna(cutoff_percentile):
+            margin_percentile = student_percentile - cutoff_percentile
+            eligibility_score = min(1.0, max(0.0, margin_percentile / 10.0))  # Normalize to 0-1
+            score += 0.4 * eligibility_score
+        
+        if not pd.isna(cutoff_rank):
+            margin_rank = cutoff_rank - student_rank
+            rank_score = min(1.0, max(0.0, margin_rank / 10000.0))  # Normalize to 0-1
+            score += 0.3 * rank_score
+        
+        # 2. College quality boost (based on name patterns)
         quality_boost = 0.0
         if any(keyword in college_name.upper() for keyword in ['IIT', 'NIT', 'BITS', 'IIIT']):
             quality_boost += 0.2
         elif any(keyword in college_name.upper() for keyword in ['INSTITUTE', 'TECHNOLOGY', 'ENGINEERING']):
             quality_boost += 0.1
         
-        # 2. Branch relevance boost
+        # 3. Branch relevance boost
         branch_boost = 0.0
         if branch.upper() in college_name.upper():
             branch_boost += 0.1
         
-        # 3. Location boost (major cities)
+        # 4. Location boost (major cities)
         location_boost = 0.0
         major_cities = ['MUMBAI', 'PUNE', 'DELHI', 'BANGALORE', 'CHENNAI', 'HYDERABAD', 'KOLKATA']
         if any(city in college_name.upper() for city in major_cities):
             location_boost += 0.05
         
-        # Calculate final score
-        final_score = base_score + quality_boost + branch_boost + location_boost
+        # 5. Cutoff competitiveness (higher cutoff = more prestigious)
+        competitiveness_score = 0.0
+        if not pd.isna(cutoff_percentile):
+            competitiveness_score = cutoff_percentile / 100.0
+        elif not pd.isna(cutoff_rank):
+            competitiveness_score = max(0.0, 1.0 - (cutoff_rank / 100000.0))
+        
+        # Combine all factors
+        final_score = score + (0.1 * quality_boost) + (0.05 * branch_boost) + (0.05 * location_boost) + (0.1 * competitiveness_score)
+        
         return max(0.0, min(1.0, final_score))
     
     def get_recommendations(self, branch: str, jee_rank: int, cet_rank: int, 
                           top_n: int = 15) -> Dict:
         """
-        Get college recommendations for a student
+        Get college recommendations for a student based on actual cutoff data
         
         Args:
             branch (str): Desired branch
@@ -210,10 +284,10 @@ class CollegeRecommendationAPI:
         Returns:
             Dict: Dictionary containing recommendations and metadata
         """
-        if not self.is_loaded:
+        if not self.is_loaded or self.cutoff_data is None or self.cutoff_data.empty:
             return {
                 'success': False,
-                'error': 'Model not loaded',
+                'error': 'Model or cutoff data not loaded',
                 'recommendations': []
             }
         
@@ -226,44 +300,64 @@ class CollegeRecommendationAPI:
             student_percentile = max(jee_percentile, cet_percentile)
             student_rank = min(jee_rank, cet_rank)
             
-            # Validate branch
-            if branch not in self.branch_encoder.classes_:
-                available_branches = list(self.branch_encoder.classes_)
+            # Filter cutoff data for the specific branch
+            branch_data = self.cutoff_data[
+                self.cutoff_data['branch'].str.contains(branch, case=False, na=False)
+            ].copy()
+            
+            if branch_data.empty:
+                # Try to find similar branches
+                all_branches = self.cutoff_data['branch'].unique()
+                similar_branches = [b for b in all_branches if any(word in b.lower() for word in branch.lower().split())]
+                
                 return {
                     'success': False,
-                    'error': f'Branch "{branch}" not found in training data',
-                    'available_branches': available_branches[:10],  # Show first 10
+                    'error': f'Branch "{branch}" not found in cutoff data',
+                    'available_branches': similar_branches[:10] if similar_branches else list(all_branches)[:10],
                     'recommendations': []
                 }
             
-            # Encode branch
-            branch_encoded = self.branch_encoder.transform([branch])[0]
+            # Find eligible colleges based on cutoff data
+            eligible_colleges = []
             
-            # Get predictions for all colleges
-            college_scores = []
+            for _, row in branch_data.iterrows():
+                college_name = row['college']
+                cutoff_percentile = row['percentile']
+                cutoff_rank = row['rank']
+                
+                # Check if student is eligible (student should have better percentile/rank than cutoff)
+                is_eligible = False
+                if not pd.isna(cutoff_percentile) and student_percentile >= cutoff_percentile:
+                    is_eligible = True
+                elif not pd.isna(cutoff_rank) and student_rank <= cutoff_rank:
+                    is_eligible = True
+                
+                if is_eligible:
+                    # Calculate recommendation score based on multiple factors
+                    score = self.calculate_recommendation_score(
+                        college_name, branch, student_percentile, student_rank,
+                        cutoff_percentile, cutoff_rank
+                    )
+                    
+                    eligible_colleges.append({
+                        'college': college_name,
+                        'score': score,
+                        'cutoff_percentile': cutoff_percentile,
+                        'cutoff_rank': cutoff_rank,
+                        'margin_percentile': student_percentile - cutoff_percentile if not pd.isna(cutoff_percentile) else None,
+                        'margin_rank': cutoff_rank - student_rank if not pd.isna(cutoff_rank) else None
+                    })
             
-            for college_idx in range(len(self.college_encoder.classes_)):
-                college_name = self.college_encoder.inverse_transform([college_idx])[0]
-                
-                # Create input features
-                X = np.array([[branch_encoded, student_percentile, student_rank]])
-                X_scaled = self.scaler.transform(X)
-                
-                # Use the actual trained model for prediction
-                base_score = self.model.predict(X_scaled)[0]
-                
-                # Calculate enhanced score
-                final_score = self.calculate_enhanced_score(college_name, branch, base_score)
-                
-                college_scores.append({
-                    'college': college_name,
-                    'score': float(final_score),
-                    'base_score': float(base_score)
-                })
+            # Remove duplicates and sort by score
+            unique_colleges = {}
+            for college in eligible_colleges:
+                college_name = college['college']
+                if college_name not in unique_colleges or college['score'] > unique_colleges[college_name]['score']:
+                    unique_colleges[college_name] = college
             
             # Sort by score and get top N
-            college_scores.sort(key=lambda x: x['score'], reverse=True)
-            top_recommendations = college_scores[:top_n]
+            sorted_colleges = sorted(unique_colleges.values(), key=lambda x: x['score'], reverse=True)
+            top_recommendations = sorted_colleges[:top_n]
             
             # Prepare response
             response = {
@@ -278,11 +372,11 @@ class CollegeRecommendationAPI:
                     'used_rank': student_rank
                 },
                 'recommendations': top_recommendations,
-                'total_colleges_analyzed': len(self.college_encoder.classes_),
+                'total_colleges_analyzed': len(unique_colleges),
                 'model_info': {
                     'model_path': self.model_path,
-                    'feature_importances': self.feature_importances.tolist(),
-                    'model_type': 'PKL'
+                    'feature_importances': self.feature_importances.tolist() if hasattr(self, 'feature_importances') else [],
+                    'model_type': 'Cutoff-based'
                 }
             }
             
@@ -299,25 +393,25 @@ class CollegeRecommendationAPI:
     
     def get_available_branches(self) -> List[str]:
         """
-        Get list of available branches
+        Get list of available branches from cutoff data
         
         Returns:
             List[str]: List of available branches
         """
-        if not self.is_loaded:
+        if self.cutoff_data is None or self.cutoff_data.empty:
             return []
-        return list(self.branch_encoder.classes_)
+        return sorted(self.cutoff_data['branch'].unique().tolist())
     
     def get_available_colleges(self) -> List[str]:
         """
-        Get list of available colleges
+        Get list of available colleges from cutoff data
         
         Returns:
             List[str]: List of available colleges
         """
-        if not self.is_loaded:
+        if self.cutoff_data is None or self.cutoff_data.empty:
             return []
-        return list(self.college_encoder.classes_)
+        return sorted(self.cutoff_data['college'].unique().tolist())
     
     def get_model_info(self) -> Dict:
         """

@@ -66,11 +66,11 @@ logs/
 *.backup
 
 # Model files (keep H5 but ignore other formats)
-*.pkl
-*.joblib
-*.pickle
-models/
-*.model
+# *.pkl
+# *.joblib
+# *.pickle
+# models/
+# *.model
 
 # Data files (keep CSV but ignore other formats)
 *.xlsx
